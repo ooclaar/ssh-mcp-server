@@ -15,7 +15,7 @@ Adicione ao seu `claude_desktop_config.json`:
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/SEU-USUARIO/ssh-mcp-server",
+        "git+https://github.com/ooclaar/ssh-mcp-server",
         "ssh-mcp-server"
       ]
     }
@@ -27,7 +27,7 @@ Adicione ao seu `claude_desktop_config.json`:
 
 ```bash
 # Clone o repositório
-git clone https://github.com/SEU-USUARIO/ssh-mcp-server
+git clone https://github.com/ooclaar/ssh-mcp-server
 cd ssh-mcp-server
 
 # Instale
@@ -162,7 +162,7 @@ Leia minha chave SSH em ~/.ssh/id_rsa e use para conectar em srv.exemplo.com
 
 ```bash
 # Clone
-git clone https://github.com/SEU-USUARIO/ssh-mcp-server
+git clone https://github.com/ooclaar/ssh-mcp-server
 cd ssh-mcp-server
 
 # Crie ambiente virtual
