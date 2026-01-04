@@ -1,11 +1,11 @@
 [project]
 name = "ssh-mcp-server"
-version = "1.0.0"
+version = "1.0.1"
 description = "MCP Server para conectar o Claude a servidores via SSH"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
-    { name = "Ramon", email = "ramon@example.com" }
+    { name = "Ramon", email = "ooclaar@gmail.com" }
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -27,8 +27,8 @@ classifiers = [
 ssh-mcp-server = "ssh_mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/seu-usuario/ssh-mcp-server"
-Repository = "https://github.com/seu-usuario/ssh-mcp-server"
+Homepage = "https://github.com/ooclaar/ssh-mcp-server"
+Repository = "https://github.com/ooclaar/ssh-mcp-server"
 
 [build-system]
 requires = ["hatchling"]
