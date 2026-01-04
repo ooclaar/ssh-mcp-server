@@ -27,7 +27,6 @@ if sys.platform == "win32":
 # Armazena sessoes SSH ativas
 ssh_sessions: dict[str, "SSHSession"] = {}
 
-
 class SSHSession:
     """Gerencia uma sessao SSH persistente"""
 
