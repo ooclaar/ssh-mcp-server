@@ -24,6 +24,8 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
+import time
+
 # Armazena sessoes SSH ativas
 ssh_sessions: dict[str, "SSHSession"] = {}
 
@@ -38,6 +40,48 @@ class SSHSession:
         self.port: int = 22
         self.connected: bool = False
         self.current_dir: str = "~"
+        
+        # Armazena credenciais para reconexao automatica
+        self._password: Optional[str] = None
+        self._private_key: Optional[str] = None
+        
+        # Timeout de inatividade (30 minutos)
+        self._last_activity: float = 0.0
+        self._timeout_seconds: float = 1800.0  # 30 minutos
+
+    def _update_activity(self):
+        """Atualiza carimbo de tempo da ultima atividade."""
+        self._last_activity = time.time()
+
+    def _check_timeout(self) -> bool:
+        """Verifica se houve timeout por inatividade. Retorna True se timed out."""
+        if not self.connected:
+            return False
+            
+        if time.time() - self._last_activity > self._timeout_seconds:
+            self.disconnect()
+            return True
+        return False
+
+    def _reconnect(self) -> bool:
+        """Tenta restabelecer a conexao perdida."""
+        print(f"Tentando reconectar a {self.username}@{self.hostname}...", file=sys.stderr)
+        try:
+            if self.client:
+                self.client.close()
+            
+            # Reutiliza logica de conexao mas mantendo estado interno
+            success, _ = self.connect(
+                self.hostname, 
+                self.username, 
+                self._password, 
+                self._private_key, 
+                self.port
+            )
+            return success
+        except Exception as e:
+            print(f"Falha na reconexao: {e}", file=sys.stderr)
+            return False
 
     def connect(
         self,
@@ -52,6 +96,10 @@ class SSHSession:
         try:
             self.client = paramiko.SSHClient()
             self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            # Armazena credenciais
+            self._password = password
+            self._private_key = private_key
 
             connect_kwargs = {
                 "hostname": hostname,
@@ -94,15 +142,25 @@ class SSHSession:
                 return False, "E necessario fornecer senha ou chave privada"
 
             self.client.connect(**connect_kwargs)
+            
+            # Habilita keep-alive (a cada 30s envia pacote dummy)
+            self.client.get_transport().set_keepalive(30)
 
             self.hostname = hostname
             self.username = username
             self.port = port
             self.connected = True
+            
+            # Inicializa timer de inatividade
+            self._update_activity()
 
-            # Obtem diretorio atual
-            _, stdout, _ = self.client.exec_command("pwd")
-            self.current_dir = stdout.read().decode().strip()
+            # Obtem diretorio atual se nao estiver reconectando (usa ~ se falhar)
+            if self.current_dir == "~":
+                try:
+                    _, stdout, _ = self.client.exec_command("pwd")
+                    self.current_dir = stdout.read().decode().strip()
+                except:
+                    pass
 
             return True, f"Conectado a {username}@{hostname}:{port}"
 
@@ -117,6 +175,14 @@ class SSHSession:
 
     def execute(self, command: str, timeout: int = 60) -> dict:
         """Executa um comando no servidor remoto."""
+        if self._check_timeout():
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": "Conexao encerrada por inatividade (> 30 min). Reconecte.",
+                "exit_code": -1,
+            }
+
         if not self.connected or not self.client:
             return {
                 "success": False,
@@ -125,97 +191,158 @@ class SSHSession:
                 "exit_code": -1,
             }
 
-        try:
-            # Executa no diretorio atual
-            full_command = f"cd {self.current_dir} 2>/dev/null; {command}"
+        retries = 1
+        while retries >= 0:
+            try:
+                # Executa no diretorio atual
+                full_command = f"cd {self.current_dir} 2>/dev/null; {command}"
 
-            _, stdout, stderr = self.client.exec_command(full_command, timeout=timeout)
+                _, stdout, stderr = self.client.exec_command(full_command, timeout=timeout)
 
-            stdout_text = stdout.read().decode("utf-8", errors="replace")
-            stderr_text = stderr.read().decode("utf-8", errors="replace")
-            exit_code = stdout.channel.recv_exit_status()
+                stdout_text = stdout.read().decode("utf-8", errors="replace")
+                stderr_text = stderr.read().decode("utf-8", errors="replace")
+                exit_code = stdout.channel.recv_exit_status()
 
-            # Atualiza diretorio atual se foi um comando cd
-            if command.strip().startswith("cd "):
-                _, pwd_stdout, _ = self.client.exec_command(
-                    f"cd {self.current_dir} 2>/dev/null; {command} && pwd"
-                )
-                new_dir = pwd_stdout.read().decode().strip()
-                if new_dir:
-                    self.current_dir = new_dir
+                # Atualiza diretorio atual se foi um comando cd
+                if command.strip().startswith("cd "):
+                    _, pwd_stdout, _ = self.client.exec_command(
+                        f"cd {self.current_dir} 2>/dev/null; {command} && pwd"
+                    )
+                    new_dir = pwd_stdout.read().decode().strip()
+                    if new_dir:
+                        self.current_dir = new_dir
+                
+                self._update_activity()
+                return {
+                    "success": exit_code == 0,
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                    "exit_code": exit_code,
+                    "cwd": self.current_dir,
+                }
 
-            return {
-                "success": exit_code == 0,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "exit_code": exit_code,
-                "cwd": self.current_dir,
-            }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Erro: {str(e)}",
-                "exit_code": -1,
-            }
+            except (paramiko.SSHException, BrokenPipeError, ConnectionResetError) as e:
+                if retries > 0:
+                    print(f"Erro de conexao ({e}), tentando reconectar...", file=sys.stderr)
+                    if self._reconnect():
+                        retries -= 1
+                        continue
+                
+                return {
+                    "success": False,
+                    "stdout": "",
+                    "stderr": f"Erro de conexao: {str(e)}",
+                    "exit_code": -1,
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "stdout": "",
+                    "stderr": f"Erro: {str(e)}",
+                    "exit_code": -1,
+                }
+            
+            # Se chegou aqui sem retornar e sem exception (loop break), break just in case
+            break
 
     def upload_file(self, content: str, remote_path: str) -> tuple[bool, str]:
         """Faz upload de conteudo para um arquivo remoto."""
+        if self._check_timeout():
+            return False, "Conexao encerrada por inatividade (> 30 min)"
+
         if not self.connected or not self.client:
             return False, "Nao conectado"
 
-        try:
-            sftp = self.client.open_sftp()
+        retries = 1
+        while retries >= 0:
+            try:
+                sftp = self.client.open_sftp()
 
-            # Expande ~ no caminho remoto
-            if remote_path.startswith("~"):
-                remote_path = remote_path.replace("~", self.current_dir.split("/")[0] or "/root", 1)
+                # Expande ~ no caminho remoto
+                target_path = remote_path
+                if target_path.startswith("~"):
+                    target_path = target_path.replace("~", self.current_dir.split("/")[0] or "/root", 1)
 
-            with sftp.file(remote_path, "w") as f:
-                f.write(content)
-            sftp.close()
-            return True, f"Arquivo criado: {remote_path}"
-        except Exception as e:
-            return False, f"Erro no upload: {str(e)}"
+                with sftp.file(target_path, "w") as f:
+                    f.write(content)
+                sftp.close()
+                self._update_activity()
+                return True, f"Arquivo criado: {remote_path}"
+            
+            except (paramiko.SSHException, OSError) as e: # OSError often wraps socket errors in paramiko
+                if retries > 0 and (not self.client.get_transport() or not self.client.get_transport().is_active()):
+                     if self._reconnect():
+                        retries -= 1
+                        continue
+                return False, f"Erro no upload: {str(e)}"
+            except Exception as e:
+                return False, f"Erro no upload: {str(e)}"
+            
+            break
 
     def download_file(self, remote_path: str) -> tuple[bool, str]:
         """Faz download do conteudo de um arquivo remoto."""
+        if self._check_timeout():
+            return False, "Conexao encerrada por inatividade (> 30 min)"
+            
         if not self.connected or not self.client:
             return False, "Nao conectado"
 
-        try:
-            sftp = self.client.open_sftp()
-            with sftp.file(remote_path, "r") as f:
-                content = f.read().decode("utf-8", errors="replace")
-            sftp.close()
-            return True, content
-        except Exception as e:
-            return False, f"Erro no download: {str(e)}"
+        retries = 1
+        while retries >= 0:
+            try:
+                sftp = self.client.open_sftp()
+                with sftp.file(remote_path, "r") as f:
+                    content = f.read().decode("utf-8", errors="replace")
+                sftp.close()
+                self._update_activity()
+                return True, content
+            except (paramiko.SSHException, OSError) as e:
+                if retries > 0 and (not self.client.get_transport() or not self.client.get_transport().is_active()):
+                     if self._reconnect():
+                        retries -= 1
+                        continue
+                return False, f"Erro no download: {str(e)}"
+            except Exception as e:
+                return False, f"Erro no download: {str(e)}"
+            break
 
     def list_dir(self, path: str = ".") -> tuple[bool, str]:
         """Lista arquivos em um diretorio remoto."""
+        if self._check_timeout():
+            return False, "Conexao encerrada por inatividade (> 30 min)"
+
         if not self.connected or not self.client:
             return False, "Nao conectado"
 
-        try:
-            sftp = self.client.open_sftp()
-            if path == ".":
-                path = self.current_dir
+        retries = 1
+        while retries >= 0:
+            try:
+                sftp = self.client.open_sftp()
+                if path == ".":
+                    path = self.current_dir
 
-            files = sftp.listdir_attr(path)
-            sftp.close()
+                files = sftp.listdir_attr(path)
+                sftp.close()
 
-            result = []
-            for f in files:
-                is_dir = f.st_mode and (f.st_mode & 0o40000)
-                file_type = "[DIR]" if is_dir else "[FILE]"
-                size = f"{f.st_size:,}" if f.st_size else "-"
-                result.append(f"{file_type} {f.filename:<40} {size:>12}")
-
-            return True, "\n".join(result) if result else "(diretorio vazio)"
-        except Exception as e:
-            return False, f"Erro ao listar: {str(e)}"
+                result = []
+                for f in files:
+                    is_dir = f.st_mode and (f.st_mode & 0o40000)
+                    file_type = "[DIR]" if is_dir else "[FILE]"
+                    size = f"{f.st_size:,}" if f.st_size else "-"
+                    result.append(f"{file_type} {f.filename:<40} {size:>12}")
+                
+                self._update_activity()
+                return True, "\n".join(result) if result else "(diretorio vazio)"
+            except (paramiko.SSHException, OSError) as e:
+                 if retries > 0 and (not self.client.get_transport() or not self.client.get_transport().is_active()):
+                     if self._reconnect():
+                        retries -= 1
+                        continue
+                 return False, f"Erro ao listar: {str(e)}"
+            except Exception as e:
+                return False, f"Erro ao listar: {str(e)}"
+            break
 
     def disconnect(self) -> str:
         """Encerra a conexao SSH."""
@@ -226,12 +353,17 @@ class SSHSession:
 
     def get_info(self) -> str:
         """Retorna informacoes sobre a conexao atual."""
+        status = "Conectado" if self.connected else "Desconectado"
+        if self.connected and self._check_timeout(): # Check timeout just to update status if needed
+             status = "Desconectado (Timeout)"
+        
         if not self.connected:
-            return "Status: Desconectado\nUse ssh_connect para conectar a um servidor."
+            return f"Status: {status}\nUse ssh_connect para conectar a um servidor."
 
-        return f"""Status: Conectado
+        return f"""Status: {status}
 Servidor: {self.username}@{self.hostname}:{self.port}
-Diretorio atual: {self.current_dir}"""
+Diretorio atual: {self.current_dir}
+Ultima atividade: {time.ctime(self._last_activity)}"""
 
 
 def get_session(session_id: str = "default") -> SSHSession:
