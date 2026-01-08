@@ -194,8 +194,18 @@ class SSHSession:
         retries = 1
         while retries >= 0:
             try:
-                # Executa no diretorio atual
-                full_command = f"cd {self.current_dir} 2>/dev/null; {command}"
+                # Prepara o comando
+                # Se comeca com cd, precisamos capturar o novo diretorio na mesma execucao
+                # para evitar re-executar comandos com efeitos colaterais (ex: cd x && nmap ...)
+                is_cd_command = command.strip().startswith("cd ")
+                pwd_marker = "___MCP_PWD_MARKER___"
+                
+                if is_cd_command:
+                    # Executa: cd atual; comando; guarda exit code; echo marker + pwd; exit com exit code
+                    full_command = f"cd {self.current_dir} 2>/dev/null; {command}; RC=$?; echo; echo '{pwd_marker}'$(pwd); exit $RC"
+                else:
+                    # Executa normal no diretorio atual
+                    full_command = f"cd {self.current_dir} 2>/dev/null; {command}"
 
                 _, stdout, stderr = self.client.exec_command(full_command, timeout=timeout)
 
@@ -203,14 +213,22 @@ class SSHSession:
                 stderr_text = stderr.read().decode("utf-8", errors="replace")
                 exit_code = stdout.channel.recv_exit_status()
 
-                # Atualiza diretorio atual se foi um comando cd
-                if command.strip().startswith("cd "):
-                    _, pwd_stdout, _ = self.client.exec_command(
-                        f"cd {self.current_dir} 2>/dev/null; {command} && pwd"
-                    )
-                    new_dir = pwd_stdout.read().decode().strip()
-                    if new_dir:
-                        self.current_dir = new_dir
+                # Se foi um comando cd, processa a saida para extrair o novo diretorio
+                if is_cd_command:
+                    # Procura o marcador no final da saida
+                    if pwd_marker in stdout_text:
+                        parts = stdout_text.rsplit(pwd_marker, 1)
+                        real_stdout = parts[0]
+                        new_pwd = parts[1].strip()
+                        
+                        # Remove a quebra de linha extra que colocamos antes do marcador
+                        if real_stdout.endswith("\n"):
+                            real_stdout = real_stdout[:-1]
+                            
+                        stdout_text = real_stdout
+                        
+                        if new_pwd:
+                            self.current_dir = new_pwd
                 
                 self._update_activity()
                 return {
